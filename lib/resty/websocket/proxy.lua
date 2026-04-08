@@ -34,7 +34,7 @@ local _TYP2OPCODE = {
 
 
 local _M = {
-    _VERSION = "0.0.1",
+    _VERSION = "0.0.1-patched",
 }
 
 local _mt = { __index = _M }
@@ -99,6 +99,7 @@ function _M.new(opts)
         upstream_uri = nil,
         on_frame = opts.on_frame,
         recv_timeout = opts.recv_timeout,
+        max_idle_timeouts = opts.max_idle_timeouts or 3,
         client_max_frame_size = opts.client_max_frame_size,
         client_max_fragments = opts.client_max_fragments,
         upstream_max_frame_size = opts.upstream_max_frame_size,
@@ -164,6 +165,7 @@ local function forwarder(self, ctx)
     local on_frame = self.on_frame
     local max_frame_size = ctx.max_frame_size
     local max_fragments = ctx.max_fragments
+    local max_idle_timeouts = self.max_idle_timeouts
 
     self_state = role .. "_state"
 
@@ -181,6 +183,8 @@ local function forwarder(self, ctx)
         peer_state = "client_state"
     end
 
+    local timeout_count = 0
+
     while true do
         if self[peer_state] == _STATES.CLOSING then
             return
@@ -195,8 +199,15 @@ local function forwarder(self, ctx)
         local data, typ, err = self_ws:recv_frame()
         if not data then
             if find(err, "timeout", 1, true) then
-                log(ngx.INFO, fmt("timeout receiving frame from %s, reopening",
-                                  role))
+                timeout_count = timeout_count + 1
+                if max_idle_timeouts > 0 and timeout_count >= max_idle_timeouts then
+                    log(ngx.WARN, fmt("%s idle timeout after %d consecutive timeouts, closing",
+                                      role, timeout_count))
+                    self[self_state] = _STATES.CLOSING
+                    return role, "idle timeout"
+                end
+                log(ngx.INFO, fmt("timeout receiving frame from %s (%d/%d), reopening",
+                                  role, timeout_count, max_idle_timeouts))
                 -- continue
 
             elseif find(err, "closed", 1, true) then
@@ -209,6 +220,11 @@ local function forwarder(self, ctx)
                 self[self_state] = _STATES.CLOSING
                 return role, err
             end
+        end
+
+        -- reset timeout counter on successful receive
+        if data then
+            timeout_count = 0
         end
 
         -- special flags
